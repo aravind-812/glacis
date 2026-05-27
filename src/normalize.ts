@@ -1,7 +1,12 @@
-import Anthropic from '@anthropic-ai/sdk'
+import { ChatAnthropic } from '@langchain/anthropic'
+import { ChatOpenAI } from '@langchain/openai'
+import { ChatGoogleGenerativeAI } from '@langchain/google-genai'
+import { SystemMessage, HumanMessage } from '@langchain/core/messages'
+import { z } from 'zod'
 import { NormalizedEvent } from './types'
 
-const client = new Anthropic()
+const TIER1_MODEL = process.env.LLM_TIER1_MODEL ?? 'claude-haiku-4-5-20251001'
+const TIER2_MODEL = process.env.LLM_TIER2_MODEL ?? 'claude-sonnet-4-6'
 
 const SYSTEM_PROMPT = `You are a webhook normalizer for a logistics platform.
 Given a raw vendor JSON payload, return ONLY a valid JSON object. No prose, no markdown, just JSON.
@@ -20,19 +25,6 @@ INVOICE statuses:
   VOIDED   — cancelled, voided
   REFUNDED — refunded, reversed, credit note issued
 
-Return this exact shape:
-{
-  "type": "SHIPMENT" | "INVOICE" | "UNCLASSIFIED",
-  "vendor_event_id": string,
-  "tracking_id": string | null,
-  "invoice_ref": string | null,
-  "status": string | null,
-  "carrier": string | null,
-  "location": string | null,
-  "event_time": "ISO8601" | null,
-  "amount_raw": string | null
-}
-
 Rules:
 - If a field is not present or cannot be determined, use null.
 - For vendor_event_id: prefer explicit event/message IDs; fallback to doc_ref or invoice ref.
@@ -41,40 +33,57 @@ Rules:
 - For event_time: use the most specific timestamp available, convert to ISO8601.
 - For amount_raw: copy the exact string from the payload, do not reformat.`
 
-async function callClaude(model: string, payload: unknown): Promise<NormalizedEvent | null> {
+const NormalizedEventSchema = z.object({
+  type: z.enum(['SHIPMENT', 'INVOICE', 'UNCLASSIFIED']),
+  vendor_event_id: z.string().nullable(),
+  tracking_id: z.string().nullable(),
+  invoice_ref: z.string().nullable(),
+  status: z.string().nullable(),
+  carrier: z.string().nullable(),
+  location: z.string().nullable(),
+  event_time: z.string().nullable(),
+  amount_raw: z.string().nullable(),
+})
+
+async function callModel(modelName: string, payload: unknown): Promise<NormalizedEvent | null> {
   try {
-    const message = await client.messages.create({
-      model,
-      max_tokens: 500,
-      system: [{ type: 'text', text: SYSTEM_PROMPT, cache_control: { type: 'ephemeral' } }],
-      messages: [{ role: 'user', content: JSON.stringify(payload) }],
-    })
+    const messages = [
+      new SystemMessage(SYSTEM_PROMPT),
+      new HumanMessage(JSON.stringify(payload)),
+    ]
 
-    const text = message.content[0].type === 'text' ? message.content[0].text : null
-    if (!text) return null
+    let result: z.infer<typeof NormalizedEventSchema>
 
-    const cleaned = text.trim().replace(/^```(?:json)?\n?/, '').replace(/\n?```$/, '')
-    const parsed = JSON.parse(cleaned) as NormalizedEvent
-    return parsed
+    if (modelName.startsWith('claude')) {
+      const llm = new ChatAnthropic({ model: modelName })
+      result = await llm.withStructuredOutput(NormalizedEventSchema).invoke(messages)
+    } else if (modelName.startsWith('gpt') || modelName.startsWith('o1') || modelName.startsWith('o3') || modelName.startsWith('o4')) {
+      const llm = new ChatOpenAI({ model: modelName })
+      result = await llm.withStructuredOutput(NormalizedEventSchema).invoke(messages)
+    } else if (modelName.startsWith('gemini')) {
+      const llm = new ChatGoogleGenerativeAI({ model: modelName })
+      result = await llm.withStructuredOutput(NormalizedEventSchema).invoke(messages)
+    } else {
+      throw new Error(`Cannot infer provider for model: ${modelName}`)
+    }
+
+    return result as NormalizedEvent
   } catch {
     return null
   }
 }
 
 export async function normalize(payload: unknown): Promise<NormalizedEvent> {
-  // Tier 1: Haiku (fast, cheap)
-  const haiku = await callClaude('claude-haiku-4-5-20251001', payload)
-
-  if (haiku && haiku.type !== 'UNCLASSIFIED' && haiku.vendor_event_id) {
-    return haiku
+  // Tier 1: fast/cheap model
+  const tier1 = await callModel(TIER1_MODEL, payload)
+  if (tier1 && tier1.type !== 'UNCLASSIFIED' && tier1.vendor_event_id) {
+    return tier1
   }
 
-  // Tier 2: Sonnet (ambiguous or missing key field)
-  const sonnet = await callClaude('claude-sonnet-4-6', payload)
+  // Tier 2: capable fallback for ambiguous or unclassified payloads
+  const tier2 = await callModel(TIER2_MODEL, payload)
+  if (tier2) return tier2
 
-  if (sonnet) return sonnet
-
-  // Both failed — store raw as unclassified
   return {
     type: 'UNCLASSIFIED',
     vendor_event_id: null,

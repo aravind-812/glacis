@@ -65,23 +65,41 @@ The two layers together handle both sequential duplicates (same vendor resending
 
 **Trade-off:** The server fast-path is a non-atomic read — a payload received twice in quick succession can both pass the read check and reach the queue. The worker's atomic INSERT is the true dedup gate; the server check is a performance optimization only.
 
-### 3. Two-tier LLM normalization
+### 3. Two-tier LLM normalization (model-agnostic)
 
-Haiku processes every payload first (fast, cheap). If Haiku returns `UNCLASSIFIED` or omits `vendor_event_id`, Sonnet retries (more capable, higher cost).
+Normalization runs through LangChain, making the provider swappable via environment variables. The provider is inferred from the model name prefix — no code change needed to switch from Anthropic to OpenAI or Google.
 
-This keeps cost low for well-structured payloads while preserving accuracy for ambiguous ones. The system prompt uses `cache_control: { type: 'ephemeral' }` to cache the prompt prefix across calls.
+| Prefix | Provider | Env key required |
+|---|---|---|
+| `claude-*` | Anthropic | `ANTHROPIC_API_KEY` |
+| `gpt-*`, `o1-*`, `o3-*`, `o4-*` | OpenAI | `OPENAI_API_KEY` |
+| `gemini-*` | Google | `GOOGLE_API_KEY` |
 
-**Trade-off:** Haiku's 4096-token minimum cache threshold means the ~400-token system prompt will not be served from cache until it exceeds that threshold in practice. Caching becomes effective only when traffic volume is high enough for the prefix to stay warm. Extending the system prompt with more vendor-specific examples would both improve accuracy and activate caching sooner.
+Tier 1 (`LLM_TIER1_MODEL`) runs first — fast, cheap. If it returns `UNCLASSIFIED` or omits `vendor_event_id`, Tier 2 (`LLM_TIER2_MODEL`) retries with a more capable model. Both tiers can use models from different providers.
+
+```
+# Example: OpenAI tiering
+LLM_TIER1_MODEL=gpt-4o-mini
+LLM_TIER2_MODEL=gpt-4o
+
+# Example: mixed-provider tiering
+LLM_TIER1_MODEL=claude-haiku-4-5-20251001
+LLM_TIER2_MODEL=gpt-4o
+```
+
+LangChain's `.withStructuredOutput(zod)` enforces the output shape via each provider's native tool/function-calling API — no manual JSON parsing or regex stripping.
+
+**Trade-off:** LangChain abstracts away provider-specific features. Anthropic's `cache_control` prompt caching is not expressible through the LangChain interface and was removed in this version. If caching is needed, it can be re-added per-provider by passing extra options to the respective LangChain class constructor.
 
 **Why not regex/rules-based classification?** Logistics vendors have no standard payload schema. The same semantic event ("vessel departed") is expressed as `status: "SAILED"`, `event_type: "VD"`, `milestone: "ATD"`, or free-text across carriers. An LLM handles the long tail without per-vendor parsers.
 
 #### System Prompt
 
-Sent on every LLM call (both Haiku and Sonnet tiers), cached with `cache_control: { type: 'ephemeral' }`:
+Sent on every LLM call (both tiers). Output shape is enforced by `.withStructuredOutput()`, so the "Return this exact shape" block is omitted from the prompt:
 
 ```
 You are a webhook normalizer for a logistics platform.
-Given a raw vendor JSON payload, return ONLY a valid JSON object. No prose, no markdown, just JSON.
+Given a raw vendor JSON payload, classify and extract key fields.
 
 Classify into: SHIPMENT, INVOICE, or UNCLASSIFIED.
 
@@ -97,19 +115,6 @@ INVOICE statuses:
   VOIDED   — cancelled, voided
   REFUNDED — refunded, reversed, credit note issued
 
-Return this exact shape:
-{
-  "type": "SHIPMENT" | "INVOICE" | "UNCLASSIFIED",
-  "vendor_event_id": string,
-  "tracking_id": string | null,
-  "invoice_ref": string | null,
-  "status": string | null,
-  "carrier": string | null,
-  "location": string | null,
-  "event_time": "ISO8601" | null,
-  "amount_raw": string | null
-}
-
 Rules:
 - If a field is not present or cannot be determined, use null.
 - For vendor_event_id: prefer explicit event/message IDs; fallback to doc_ref or invoice ref.
@@ -119,7 +124,7 @@ Rules:
 - For amount_raw: copy the exact string from the payload, do not reformat.
 ```
 
-The user message is the raw vendor JSON payload stringified. No conversation history is sent — each call is stateless.
+The user message is the raw vendor JSON payload stringified. No conversation history is sent — each call is stateless. Output shape is enforced by the provider's tool/function-calling API via LangChain's `.withStructuredOutput()`.
 
 ### 4. Status rank guards
 
@@ -195,7 +200,11 @@ npm install
 
 # 3. Configure environment
 cp .env.example .env
-# edit .env — add ANTHROPIC_API_KEY
+# edit .env — set the API key for your chosen provider:
+#   Anthropic → ANTHROPIC_API_KEY
+#   OpenAI    → OPENAI_API_KEY
+#   Google    → GOOGLE_API_KEY
+# Optionally set LLM_TIER1_MODEL and LLM_TIER2_MODEL (defaults to claude-haiku / claude-sonnet)
 
 # 4. Apply migrations
 npx prisma migrate deploy
