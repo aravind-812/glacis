@@ -1,113 +1,138 @@
 # Galcis — Logistics Webhook Normalizer
 
-Accepts raw webhook payloads from logistics vendors, classifies them via LLM, and persists normalized records to PostgreSQL. Handles duplicates, out-of-order events, and transient failures without losing data.
+A backend service that ingests arbitrary vendor webhook payloads, classifies them via LLM, normalizes to a canonical schema, and persists to PostgreSQL — with sub-second acknowledgment, duplicate discard, and out-of-order event handling.
 
-## Architecture
+---
+
+## Request Flow
 
 ```
-POST /webhook
-     │
-     ▼
-┌──────────────┐   duplicate?   ┌───────────────────┐
-│    Server    │──────yes──────▶│  202 (discarded)  │
-│  (Express)   │                └───────────────────┘
-│              │   new
-│  hash check  │──────────────▶ pg-boss queue (webhooks)
-└──────────────┘                         │
-                                         ▼
-                                ┌────────────────────┐
-                                │      Worker        │
-                                │                    │
-                                │  1. hash check     │
-                                │  2. normalize()    │
-                                │     └─ Haiku first │
-                                │     └─ Sonnet fb   │
-                                │  3. upsert()       │
-                                │  4. record hash    │
-                                └────────────────────┘
-                                         │
-                              ┌──────────┼──────────┐
-                              ▼          ▼          ▼
-                         shipments   invoices  unclassified
+Vendor
+  │
+  │  POST /webhook (any JSON)
+  ▼
+┌─────────────────────────────────────────┐
+│               Express Server            │
+│                                         │
+│  1. Validate body is JSON               │
+│  2. SHA-256 hash of key-sorted payload  │
+│  3. Lookup hash in payload_hashes       │
+│     ├── found  →  202 { duplicate:true }│  ← fast discard, no queue
+│     └── new    →  boss.send()           │
+│                    202 { ok:true }      │  ← sub-second ack to vendor
+└─────────────────────────────────────────┘
+                    │
+                    ▼  pg-boss queue (webhooks)
+                    │  retryLimit: 5, exponential backoff
+                    │
+┌───────────────────▼─────────────────────┐
+│                Worker                   │
+│                                         │
+│  1. Hash check  (fast-path dedup)       │
+│     └── seen? → discard, continue      │
+│                                         │
+│  2. normalize(payload)                  │
+│     ├── Tier 1: LLM_TIER1_MODEL         │
+│     │   └── clear result? → use it     │
+│     └── Tier 2: LLM_TIER2_MODEL         │
+│         └── fallback if UNCLASSIFIED    │
+│             or missing vendor_event_id  │
+│                                         │
+│  3. upsert(normalized, hash)            │
+│     └── rank-guarded write              │
+│                                         │
+│  4. INSERT INTO payload_hashes          │
+│     ON CONFLICT DO NOTHING              │  ← atomic dedup gate
+│     RETURNING hash                      │
+│     └── empty result = race duplicate  │
+│         → discard silently             │
+└─────────────────────────────────────────┘
+         │              │             │
+         ▼              ▼             ▼
+    shipments       invoices    unclassified
 ```
 
-### Components
+---
 
-| File | Role |
-|---|---|
-| `src/server.ts` | Express HTTP server; validates, hashes, enqueues |
-| `src/boss.ts` | pg-boss singleton; queue config with retry policy |
-| `src/worker.ts` | Job processor; dedup, normalize, upsert, record hash |
-| `src/normalize.ts` | Two-tier LLM classification (Haiku → Sonnet fallback) |
-| `src/upsert.ts` | Prisma writes; rank-guarded updates |
-| `src/hash.ts` | SHA-256 of key-sorted JSON for stable payload identity |
-| `src/types.ts` | Canonical status enums and rank tables |
-| `prisma/schema.prisma` | DB models: Shipment, Invoice, Unclassified, PayloadHash |
+## Duplicate Detection — Two Layers
 
-## Key Design Decisions
+```
+Vendor sends payload P (first time)
+  │
+  ├─[Server]──── hash(P) not in payload_hashes ──→ enqueue ──→ Worker processes ──→ INSERT hash
+  │
+Vendor resends payload P (duplicate)
+  │
+  ├─[Server]──── hash(P) found in payload_hashes ──→ 202 {duplicate:true}  ← never queued
+  │
+Two workers race on same job
+  │
+  ├─[Worker A]── hash not seen ──→ normalize ──→ upsert ──→ INSERT hash → gets RETURNING row ✓
+  └─[Worker B]── hash not seen ──→ normalize ──→ upsert ──→ INSERT hash → ON CONFLICT, empty result → discard ✓
+```
 
-### 1. Async queue over synchronous processing
+**Layer 1 (Server):** non-atomic read — performance filter, not the source of truth.  
+**Layer 2 (Worker):** `INSERT ... ON CONFLICT DO NOTHING RETURNING hash` — atomic gate. Only one worker wins.
 
-Webhooks are accepted immediately (202) and processed in the background. This decouples vendor latency from DB/LLM latency, prevents lost events on downstream failure, and allows horizontal scaling of workers independently from the HTTP surface.
+---
 
-**Trade-off:** Vendors receive 202 before the event is fully processed. If the queue or worker crashes between enqueue and commit, pg-boss retries the job — handled by the dedup layer.
+## Out-of-Order Events — Status Rank Guard
 
-### 2. Content-addressed deduplication
+Every record stores a `status_rank` integer. Updates are only applied if the incoming rank is strictly higher.
 
-Payload identity is SHA-256 of key-sorted JSON. Key sorting makes the hash stable across vendors that send semantically identical payloads with non-deterministic key order.
+```
+Shipment ranks:   PICKED_UP(1) → IN_TRANSIT(2) → OUT_FOR_DELIVERY(3) → DELIVERED(4)
+Invoice ranks:    ISSUED(1) → VOIDED(2) | PAID(3) → REFUNDED(4)
 
-Two layers prevent duplicates reaching the DB:
+Example: DELIVERED arrives before IN_TRANSIT
+  ┌─────────────────────────────────────────────────────────┐
+  │  Event 1: DELIVERED (rank 4) → no row exists → INSERT   │
+  │           row: { status: DELIVERED, status_rank: 4 }    │
+  │                                                         │
+  │  Event 2: IN_TRANSIT (rank 2) → row exists              │
+  │           incoming rank 2 > stored rank 4? NO → skip    │
+  │           result: DELIVERED preserved ✓                  │
+  └─────────────────────────────────────────────────────────┘
+```
 
-1. **Server fast-path** — `payloadHash.findUnique` before enqueue. Filters obvious repeats; avoids queuing known work.
-2. **Worker atomic write** — `INSERT INTO payload_hashes ... ON CONFLICT DO NOTHING RETURNING hash`. Only the first worker to commit gets `RETURNING hash`. All others see an empty result set and discard.
+---
 
-The two layers together handle both sequential duplicates (same vendor resending) and concurrent duplicates (two workers racing on the same job).
+## LLM Normalization — Two-Tier
 
-**Trade-off:** The server fast-path is a non-atomic read — a payload received twice in quick succession can both pass the read check and reach the queue. The worker's atomic INSERT is the true dedup gate; the server check is a performance optimization only.
+```
+payload
+   │
+   ▼
+Tier 1 ── LLM_TIER1_MODEL (fast / cheap)
+   │
+   ├── type != UNCLASSIFIED AND vendor_event_id present?
+   │     YES → return result                    ← ~80% of traffic exits here
+   │     NO  ↓
+   ▼
+Tier 2 ── LLM_TIER2_MODEL (capable / fallback)
+   │
+   └── return result (or hardcoded UNCLASSIFIED if both fail)
+```
 
-### 3. Two-tier LLM normalization (model-agnostic)
+Provider inferred from model name — no code change to switch vendors:
 
-Normalization runs through LangChain, making the provider swappable via environment variables. The provider is inferred from the model name prefix — no code change needed to switch from Anthropic to OpenAI or Google.
-
-| Prefix | Provider | Env key required |
+| Model prefix | Provider | API key |
 |---|---|---|
 | `claude-*` | Anthropic | `ANTHROPIC_API_KEY` |
-| `gpt-*`, `o1-*`, `o3-*`, `o4-*` | OpenAI | `OPENAI_API_KEY` |
+| `gpt-*` `o1-*` `o3-*` `o4-*` | OpenAI | `OPENAI_API_KEY` |
 | `gemini-*` | Google | `GOOGLE_API_KEY` |
 
-Tier 1 (`LLM_TIER1_MODEL`) runs first — fast, cheap. If it returns `UNCLASSIFIED` or omits `vendor_event_id`, Tier 2 (`LLM_TIER2_MODEL`) retries with a more capable model. Both tiers can use models from different providers.
+Output shape enforced via LangChain `.withStructuredOutput(zod)` — provider's native tool/function-calling API, no regex parsing.
 
+**System prompt** (both tiers, stateless — no conversation history):
 ```
-# Example: OpenAI tiering
-LLM_TIER1_MODEL=gpt-4o-mini
-LLM_TIER2_MODEL=gpt-4o
-
-# Example: mixed-provider tiering
-LLM_TIER1_MODEL=claude-haiku-4-5-20251001
-LLM_TIER2_MODEL=gpt-4o
-```
-
-LangChain's `.withStructuredOutput(zod)` enforces the output shape via each provider's native tool/function-calling API — no manual JSON parsing or regex stripping.
-
-**Trade-off:** LangChain abstracts away provider-specific features. Anthropic's `cache_control` prompt caching is not expressible through the LangChain interface and was removed in this version. If caching is needed, it can be re-added per-provider by passing extra options to the respective LangChain class constructor.
-
-**Why not regex/rules-based classification?** Logistics vendors have no standard payload schema. The same semantic event ("vessel departed") is expressed as `status: "SAILED"`, `event_type: "VD"`, `milestone: "ATD"`, or free-text across carriers. An LLM handles the long tail without per-vendor parsers.
-
-#### System Prompt
-
-Sent on every LLM call (both tiers). Output shape is enforced by `.withStructuredOutput()`, so the "Return this exact shape" block is omitted from the prompt:
-
-```
-You are a webhook normalizer for a logistics platform.
-Given a raw vendor JSON payload, classify and extract key fields.
-
 Classify into: SHIPMENT, INVOICE, or UNCLASSIFIED.
 
 SHIPMENT statuses (map vendor language to canonical):
-  PICKED_UP         — gate-in, container received, released to shipper, empty returned and full received
-  IN_TRANSIT        — loaded onboard, vessel sailed, departed, in movement, en route
-  OUT_FOR_DELIVERY  — out for delivery, last mile, with courier
-  DELIVERED         — delivered, released to consignee, handed to recipient, cargo released
+  PICKED_UP        — gate-in, container received, empty returned and full received
+  IN_TRANSIT       — loaded onboard, vessel sailed, departed, en route
+  OUT_FOR_DELIVERY — out for delivery, last mile, with courier
+  DELIVERED        — delivered, released to consignee, cargo released
 
 INVOICE statuses:
   ISSUED   — invoice raised, created, sent, generated
@@ -115,143 +140,129 @@ INVOICE statuses:
   VOIDED   — cancelled, voided
   REFUNDED — refunded, reversed, credit note issued
 
-Rules:
-- If a field is not present or cannot be determined, use null.
-- For vendor_event_id: prefer explicit event/message IDs; fallback to doc_ref or invoice ref.
-- For tracking_id on SHIPMENT: use the container number, tracking number, or primary shipment identifier.
-- For tracking_id on INVOICE: use the linked bill of lading, tracking number, or any shipment cross-reference present in the payload.
-- For event_time: use the most specific timestamp available, convert to ISO8601.
-- For amount_raw: copy the exact string from the payload, do not reformat.
+Rules: prefer explicit event IDs for vendor_event_id; convert event_time to ISO8601;
+copy amount_raw verbatim; use null for absent fields.
 ```
 
-The user message is the raw vendor JSON payload stringified. No conversation history is sent — each call is stateless. Output shape is enforced by the provider's tool/function-calling API via LangChain's `.withStructuredOutput()`.
-
-### 4. Status rank guards
-
-Events arrive out of order. A `DELIVERED` event that arrives before `IN_TRANSIT` would otherwise overwrite a later-arriving `IN_TRANSIT` and corrupt the record.
-
-`statusRank` (integer, stored on the row) gates updates: a new event only updates the record if its rank exceeds the stored rank. Both Shipment and Invoice have independent rank tables.
-
-**Trade-off:** A higher-ranked event that arrives first blocks all lower-ranked events permanently, even if the lower-ranked event contains useful fields (carrier, location). Current implementation updates only status/location/eventTime — fields that are meaningfully ordered. Immutable fields (trackingId, invoiceRef, carrier) are set on creation and never overwritten.
-
-### 5. `vendorEventId` as the upsert key
-
-Records are upserted by `vendorEventId` (the vendor's own event identifier), not by tracking number. This means the same shipment tracked by multiple vendors creates multiple rows — one per vendor event — rather than a single merged record.
-
-**Trade-off:** No cross-vendor deduplication of shipment state. The `trackingId` and `invoiceRef.trackingRef` fields provide a soft join surface for query-time grouping, but there is no foreign key relationship between invoices and shipments.
-
-### 6. Raw payload stored alongside normalized fields
-
-Every row stores the original `rawPayload` (JSONB). This means:
-- Bugs in normalization logic can be corrected by re-processing stored raws
-- The full vendor payload is available for audit or downstream consumers
-- No data is lost when a field isn't yet covered by the schema
+---
 
 ## Data Model
 
 ```
-shipments
-  id              uuid PK
-  vendor_event_id unique — vendor's own event ID
-  payload_hash    unique — SHA-256 of raw body (dedup)
-  tracking_id     — container number, B/L, or primary shipment ref
-  status          — PICKED_UP | IN_TRANSIT | OUT_FOR_DELIVERY | DELIVERED
-  status_rank     — rank guard for out-of-order updates
-  carrier         — normalized carrier name
-  location        — last known location
-  event_time      — vendor event timestamp (ISO8601)
-  raw_payload     — original JSON
+┌──────────────────────────────────────────────────────────────────┐
+│ shipments                      │ invoices                        │
+│──────────────────────────────  │─────────────────────────────────│
+│ id              uuid PK        │ id              uuid PK         │
+│ vendor_event_id unique         │ vendor_event_id unique          │
+│ payload_hash    unique         │ payload_hash    unique          │
+│ tracking_id                    │ invoice_ref                     │
+│ status          enum           │ tracking_ref    nullable ─────────→ soft join to shipments
+│ status_rank     int            │ status          enum            │
+│ carrier                        │ status_rank     int             │
+│ location                       │ amount_raw                      │
+│ event_time                     │ carrier                         │
+│ raw_payload     jsonb          │ event_time                      │
+│ created_at                     │ raw_payload     jsonb           │
+│ updated_at                     │ created_at / updated_at         │
+└────────────────────────────────┴─────────────────────────────────┘
 
-invoices
-  id              uuid PK
-  vendor_event_id unique
-  payload_hash    unique
-  invoice_ref     — invoice/document number
-  tracking_ref    — B/L or shipment cross-reference (nullable)
-  status          — ISSUED | PAID | VOIDED | REFUNDED
-  status_rank
-  carrier
-  amount_raw      — exact amount string from vendor payload
-  currency
-  event_time
-  raw_payload
-
-unclassified
-  id              uuid PK
-  payload_hash    unique
-  raw_payload
-  received_at
-
-payload_hashes
-  hash PK         — global dedup registry (all event types)
-  seen_at
+┌──────────────────────┐   ┌───────────────────────────────┐
+│ unclassified         │   │ payload_hashes                │
+│──────────────────────│   │───────────────────────────────│
+│ id       uuid PK     │   │ hash    PK  ← global dedup    │
+│ payload_hash unique  │   │ seen_at     registry           │
+│ raw_payload jsonb    │   └───────────────────────────────┘
+│ received_at          │
+└──────────────────────┘
 ```
+
+No FK between invoices and shipments — `tracking_ref` is a soft cross-reference via B/L number, joinable at query time.  
+`raw_payload` stored on every row — normalization bugs are replayable without data loss.
+
+---
+
+## Design Decisions & Trade-offs
+
+| # | Decision | Trade-off |
+|---|---|---|
+| **1** | **Async queue** — 202 immediately, process in background | Vendor gets ack before event is persisted. If worker crashes mid-job, pg-boss retries (safe — dedup handles it). |
+| **2** | **Content-addressed dedup** — SHA-256 of key-sorted JSON | Key sorting stabilises hash across vendors with non-deterministic key order. Server check is non-atomic (perf filter only); worker INSERT is the true gate. |
+| **3** | **Two-tier LLM** — cheap model first, capable fallback | Reduces cost for well-structured payloads. LangChain abstraction loses Anthropic-native prompt caching (`cache_control`) — can be re-added per-provider if needed. |
+| **4** | **Status rank guard** — only higher-rank events update the row | Prevents regression. Lower-ranked events that arrive late are permanently discarded — useful fields (location, carrier) in those events are lost. |
+| **5** | **vendorEventId as upsert key** — one row per vendor event | Multiple vendors reporting the same shipment create separate rows. `trackingId` / `tracking_ref` enable soft grouping but there is no cross-vendor merge. |
+| **6** | **Raw payload stored as JSONB** | Full audit trail, replayable. Storage cost grows linearly with volume — partition or archive old rows in production. |
+| **7** | **Rank over state machine** — integer rank, not transition graph | Simpler to implement. Does not enforce valid transitions (e.g., DELIVERED → PICKED_UP from a different vendor is allowed). Good enough for the assignment's domain rules. |
+
+---
+
+## Sample Payload Results
+
+| # | Payload | Classification | Status | Notes |
+|---|---|---|---|---|
+| 1 | Maersk sailed | SHIPMENT | IN_TRANSIT | `milestone: "Loaded onboard and sailed"` |
+| 2 | Maersk gate-in | SHIPMENT | PICKED_UP | Same container, earlier event |
+| 3 | GFP settled | INVOICE | PAID | `transaction.kind: "settled in full"` |
+| 4 | GFP raised | INVOICE | — | Same `doc_ref` → rank-blocked (PAID already stored) |
+| 5 | ONE delivered | SHIPMENT | DELIVERED | `milestone_text: "Cargo released to consignee"` |
+| 6 | Marine advisory | UNCLASSIFIED | — | No shipment or invoice semantics |
+
+Sample 4 is intentional: both GFP payloads share `doc_ref: GFP-INV-2026-Q2-08821` as their `vendor_event_id`. PAID (rank 3) arrived first; ISSUED (rank 1) was correctly blocked.
+
+---
 
 ## Running Locally
 
 **Requirements:** Node 22, Docker
 
 ```bash
-# 1. Start database
 docker compose up -d
-
-# 2. Install dependencies
 npm install
-
-# 3. Configure environment
-cp .env.example .env
-# edit .env — set the API key for your chosen provider:
-#   Anthropic → ANTHROPIC_API_KEY
-#   OpenAI    → OPENAI_API_KEY
-#   Google    → GOOGLE_API_KEY
-# Optionally set LLM_TIER1_MODEL and LLM_TIER2_MODEL (defaults to claude-haiku / claude-sonnet)
-
-# 4. Apply migrations
+cp .env.example .env        # add your LLM provider API key
 npx prisma migrate deploy
-
-# 5. Generate Prisma client
 npx prisma generate
-
-# 6. Start server
-npm run dev
+npm run dev                 # http://localhost:3000
 ```
-
-Server listens on `http://localhost:3000`.
 
 ```bash
-# Send a test payload
-curl -X POST http://localhost:3000/webhook \
-  -H "Content-Type: application/json" \
-  -d @samples/1_maersk_sailed.json
+# Test with sample payloads
+for f in samples/*.json; do
+  echo -n "$f → "
+  curl -s -X POST http://localhost:3000/webhook \
+    -H "Content-Type: application/json" -d @$f | jq .
+done
 ```
 
-**Endpoints:**
-- `POST /webhook` — ingest a raw vendor payload
-- `GET /health` — liveness check
+**Endpoints**
+
+| Method | Path | Description |
+|---|---|---|
+| `POST` | `/webhook` | Ingest any JSON payload |
+| `GET` | `/health` | Liveness check |
+
+---
 
 ## Production Roadmap
 
-### Reliability
-- **Dead-letter queue** — pg-boss jobs that exhaust retries silently disappear. A DLQ (separate queue + alerting) lets ops triage and replay failed jobs.
-- **Idempotent replay** — re-processing `raw_payload` from the DB is safe today for SHIPMENT/INVOICE (rank guards prevent regression), but UNCLASSIFIED rows have no `vendorEventId` and would re-insert on replay. Add a replay flag or normalize UNCLASSIFIED rows at replay time.
-- **Graceful shutdown** — currently `SIGTERM` kills the process mid-job. Add `boss.stop()` + drain logic so in-flight jobs complete before exit.
+### P0 — Before any real traffic
+| Item | Why |
+|---|---|
+| Webhook HMAC / bearer token auth | Any caller can currently flood the queue |
+| Graceful shutdown (`boss.stop()` + drain) | SIGTERM kills in-flight jobs |
+| Structured logging (pino) + trace IDs | `console.log` is unfilterable in prod |
+| Dead-letter queue | Exhausted retries disappear silently |
 
-### Observability
-- Structured JSON logging (replace `console.log` with pino/winston)
-- Metrics: queue depth, job latency, LLM tier hit rates, dedup rate
-- Traces: tie each job's DB and LLM calls to a trace ID for debugging classification errors
+### P1 — Scaling
+| Item | Why |
+|---|---|
+| Separate HTTP + worker containers | Worker crash takes down ingestion surface |
+| PgBouncer / shared connection pool | Two separate pools (pg-boss + Prisma) under load |
+| LLM prompt caching | System prompt is ~400 tokens; expand past provider threshold to activate caching |
+| Rules-based pre-filter for known vendors | Avoid LLM cost for deterministic high-volume payloads |
 
-### Scale
-- **Worker separation** — run HTTP server and worker as separate processes/containers so they scale independently and a worker crash doesn't take the ingestion surface down.
-- **Connection pooling** — PgBoss and Prisma each hold their own pool. Under load, add PgBouncer or use a shared pool via a connection proxy.
-- **LLM cost control** — cache the full system prompt (consider expanding it to exceed the 4096-token Haiku cache threshold), batch low-urgency payloads, or add a rules-based pre-filter for high-volume well-known vendors.
-
-### Correctness
-- **Schema validation** — add Zod validation on LLM output before writing to DB; surface extraction errors rather than silently writing null fields.
-- **Cross-vendor shipment merging** — currently one row per vendor event. A matching layer (by B/L number) could merge events from multiple carriers into a single canonical shipment timeline.
-- **Currency normalization** — `amount_raw` stores the vendor's exact string. A parse step (ISO 4217 code + decimal amount) would make invoices queryable by amount.
-
-### Security
-- **Webhook authentication** — validate HMAC signatures (or bearer tokens) per vendor before enqueuing. Currently any caller can POST to `/webhook`.
-- **Rate limiting** — add per-source IP or per-vendor-key rate limits to prevent queue flooding.
-- **Secret rotation** — `ANTHROPIC_API_KEY` and `DATABASE_URL` should be managed via a secrets manager (AWS Secrets Manager, Vault) in production, not environment variables baked into deployments.
+### P2 — Correctness
+| Item | Why |
+|---|---|
+| Cross-vendor shipment merging | One row per vendor event; no canonical timeline across carriers |
+| Atomic rank update (SQL WHERE clause) | App-level read-then-write has a race window under concurrency |
+| Currency normalization | `amount_raw` is a verbatim string, not queryable by amount |
+| Secrets manager (Vault / AWS SSM) | API keys in env vars are not rotatable at runtime |
