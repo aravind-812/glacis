@@ -1,9 +1,5 @@
-import { PrismaClient } from './generated/prisma/client'
-import { PrismaPg } from '@prisma/adapter-pg'
+import { prisma } from './db'
 import { NormalizedEvent, SHIPMENT_RANK, INVOICE_RANK, ShipmentStatus, InvoiceStatus } from './types'
-
-const adapter = new PrismaPg({ connectionString: process.env.DATABASE_URL! })
-const prisma = new PrismaClient({ adapter })
 
 export async function upsert(event: NormalizedEvent, rawPayload: unknown, hash: string): Promise<void> {
   if (event.type === 'SHIPMENT') {
@@ -20,80 +16,72 @@ export async function upsert(event: NormalizedEvent, rawPayload: unknown, hash: 
 async function upsertShipment(event: NormalizedEvent, rawPayload: unknown, hash: string): Promise<void> {
   if (!event.vendor_event_id || !event.status || !event.tracking_id) return
 
-  const incomingRank = SHIPMENT_RANK[event.status as ShipmentStatus] ?? 0
+  const statusRank = SHIPMENT_RANK[event.status as ShipmentStatus] ?? 0
   const eventTime = event.event_time ? new Date(event.event_time) : new Date()
+  const rawJson = JSON.stringify(rawPayload)
 
-  const existing = await prisma.shipment.findUnique({
-    where: { vendorEventId: event.vendor_event_id },
-  })
-
-  if (!existing) {
-    await prisma.shipment.create({
-      data: {
-        vendorEventId: event.vendor_event_id,
-        payloadHash: hash,
-        trackingId: event.tracking_id,
-        status: event.status,
-        statusRank: incomingRank,
-        carrier: event.carrier,
-        location: event.location,
-        eventTime,
-        rawPayload: rawPayload as object,
-      },
-    })
-    return
-  }
-
-  // Rank guard: only update if incoming event is newer in lifecycle
-  if (incomingRank > existing.statusRank) {
-    await prisma.shipment.update({
-      where: { vendorEventId: event.vendor_event_id },
-      data: {
-        status: event.status,
-        statusRank: incomingRank,
-        location: event.location,
-        eventTime,
-      },
-    })
-  }
+  // Single atomic statement: insert new row or update only if incoming rank is higher.
+  // WHERE shipments.status_rank < EXCLUDED.status_rank makes the guard race-free —
+  // no separate read needed, Postgres serializes it.
+  await prisma.$executeRaw`
+    INSERT INTO shipments
+      (id, vendor_event_id, payload_hash, tracking_id, status, status_rank,
+       carrier, location, event_time, raw_payload, created_at, updated_at)
+    VALUES (
+      gen_random_uuid(),
+      ${event.vendor_event_id},
+      ${hash},
+      ${event.tracking_id},
+      ${event.status},
+      ${statusRank},
+      ${event.carrier ?? null},
+      ${event.location ?? null},
+      ${eventTime},
+      ${rawJson}::jsonb,
+      now(),
+      now()
+    )
+    ON CONFLICT (vendor_event_id) DO UPDATE SET
+      status      = EXCLUDED.status,
+      status_rank = EXCLUDED.status_rank,
+      location    = EXCLUDED.location,
+      event_time  = EXCLUDED.event_time,
+      updated_at  = now()
+    WHERE shipments.status_rank < EXCLUDED.status_rank
+  `
 }
 
 async function upsertInvoice(event: NormalizedEvent, rawPayload: unknown, hash: string): Promise<void> {
   if (!event.vendor_event_id || !event.status || !event.invoice_ref) return
 
-  const incomingRank = INVOICE_RANK[event.status as InvoiceStatus] ?? 0
+  const statusRank = INVOICE_RANK[event.status as InvoiceStatus] ?? 0
   const eventTime = event.event_time ? new Date(event.event_time) : new Date()
+  const rawJson = JSON.stringify(rawPayload)
 
-  const existing = await prisma.invoice.findUnique({
-    where: { vendorEventId: event.vendor_event_id },
-  })
-
-  if (!existing) {
-    await prisma.invoice.create({
-      data: {
-        vendorEventId: event.vendor_event_id,
-        payloadHash: hash,
-        invoiceRef: event.invoice_ref,
-        trackingRef: event.tracking_id ?? null,
-        status: event.status,
-        statusRank: incomingRank,
-        carrier: event.carrier,
-        amountRaw: event.amount_raw,
-        eventTime,
-        rawPayload: rawPayload as object,
-      },
-    })
-    return
-  }
-
-  if (incomingRank > existing.statusRank) {
-    await prisma.invoice.update({
-      where: { vendorEventId: event.vendor_event_id },
-      data: {
-        status: event.status,
-        statusRank: incomingRank,
-        eventTime,
-      },
-    })
-  }
+  await prisma.$executeRaw`
+    INSERT INTO invoices
+      (id, vendor_event_id, payload_hash, invoice_ref, tracking_ref, status, status_rank,
+       carrier, amount_raw, event_time, raw_payload, created_at, updated_at)
+    VALUES (
+      gen_random_uuid(),
+      ${event.vendor_event_id},
+      ${hash},
+      ${event.invoice_ref},
+      ${event.tracking_id ?? null},
+      ${event.status},
+      ${statusRank},
+      ${event.carrier ?? null},
+      ${event.amount_raw ?? null},
+      ${eventTime},
+      ${rawJson}::jsonb,
+      now(),
+      now()
+    )
+    ON CONFLICT (vendor_event_id) DO UPDATE SET
+      status      = EXCLUDED.status,
+      status_rank = EXCLUDED.status_rank,
+      event_time  = EXCLUDED.event_time,
+      updated_at  = now()
+    WHERE invoices.status_rank < EXCLUDED.status_rank
+  `
 }

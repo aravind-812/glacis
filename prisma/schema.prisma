@@ -58,3 +58,14 @@ model PayloadHash {
 
   @@map("payload_hashes")
 }
+
+model DeadLetter {
+  id         String   @id @default(uuid())
+  jobId      String   @map("job_id")
+  payload    Json
+  error      String?
+  retryCount Int      @map("retry_count")
+  failedAt   DateTime @default(now()) @map("failed_at")
+
+  @@map("dead_letters")
+}

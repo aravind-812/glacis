@@ -4,9 +4,10 @@ import { ChatGoogleGenerativeAI } from '@langchain/google-genai'
 import { SystemMessage, HumanMessage } from '@langchain/core/messages'
 import { z } from 'zod'
 import { NormalizedEvent } from './types'
+import { config } from './config'
 
-const TIER1_MODEL = process.env.LLM_TIER1_MODEL ?? 'claude-haiku-4-5-20251001'
-const TIER2_MODEL = process.env.LLM_TIER2_MODEL ?? 'claude-sonnet-4-6'
+const TIER1_MODEL = config.LLM_TIER1_MODEL
+const TIER2_MODEL = config.LLM_TIER2_MODEL
 
 const SYSTEM_PROMPT = `You are a webhook normalizer for a logistics platform.
 Given a raw vendor JSON payload, return ONLY a valid JSON object. No prose, no markdown, just JSON.

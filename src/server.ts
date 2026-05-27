@@ -1,13 +1,10 @@
-import 'dotenv/config'
+import './config' // validate env at startup — throws if required vars missing
 import express from 'express'
-import { PrismaPg } from '@prisma/adapter-pg'
-import { PrismaClient } from './generated/prisma/client'
+import { prisma } from './db'
 import { getBoss } from './boss'
 import { startWorker } from './worker'
 import { hashPayload } from './hash'
-
-const adapter = new PrismaPg({ connectionString: process.env.DATABASE_URL! })
-const prisma = new PrismaClient({ adapter })
+import { config } from './config'
 
 const app = express()
 app.use(express.json())
@@ -23,8 +20,6 @@ app.post('/webhook', async (req, res) => {
   try {
     const hash = hashPayload(payload)
 
-    // Best-effort read: filters obvious duplicates before queuing.
-    // Not the source of truth — worker's atomic INSERT after success is.
     const seen = await prisma.payloadHash.findUnique({ where: { hash } })
     if (seen) {
       res.status(202).json({ ok: true, duplicate: true })
@@ -44,12 +39,22 @@ app.get('/health', (_req, res) => {
   res.json({ ok: true })
 })
 
+async function shutdown() {
+  console.log('[server] shutting down...')
+  const boss = await getBoss()
+  await boss.stop()         // drains in-flight jobs before exiting
+  await prisma.$disconnect()
+  process.exit(0)
+}
+
+process.on('SIGTERM', shutdown)
+process.on('SIGINT', shutdown)
+
 async function main() {
   await startWorker()
 
-  const port = process.env.PORT ?? 3000
-  app.listen(port, () => {
-    console.log(`[server] listening on port ${port}`)
+  app.listen(config.PORT, () => {
+    console.log(`[server] listening on port ${config.PORT}`)
   })
 }
 
