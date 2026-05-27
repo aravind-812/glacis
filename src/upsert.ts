@@ -74,6 +74,7 @@ async function upsertInvoice(event: NormalizedEvent, rawPayload: unknown, hash: 
         vendorEventId: event.vendor_event_id,
         payloadHash: hash,
         invoiceRef: event.invoice_ref,
+        trackingRef: event.tracking_id ?? null,
         status: event.status,
         statusRank: incomingRank,
         carrier: event.carrier,

@@ -36,6 +36,8 @@ Return this exact shape:
 Rules:
 - If a field is not present or cannot be determined, use null.
 - For vendor_event_id: prefer explicit event/message IDs; fallback to doc_ref or invoice ref.
+- For tracking_id on SHIPMENT: use the container number, tracking number, or primary shipment identifier.
+- For tracking_id on INVOICE: use the linked bill of lading, tracking number, or any shipment cross-reference present in the payload.
 - For event_time: use the most specific timestamp available, convert to ISO8601.
 - For amount_raw: copy the exact string from the payload, do not reformat.`
 

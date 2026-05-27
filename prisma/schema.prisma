@@ -29,6 +29,7 @@ model Invoice {
   vendorEventId String   @unique @map("vendor_event_id")
   payloadHash   String   @unique @map("payload_hash")
   invoiceRef    String   @map("invoice_ref")
+  trackingRef   String?  @map("tracking_ref")
   status        String
   statusRank    Int      @map("status_rank")
   carrier       String?
