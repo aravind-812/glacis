@@ -28,19 +28,20 @@ export async function startWorker(): Promise<void> {
 
         const seen = await prisma.payloadHash.findUnique({ where: { hash } })
         if (seen) {
-          console.log(`[worker] job=${job.id} duplicate — discarded`)
+          console.log(`[worker] duplicate — discarded`)
           continue
         }
 
         try {
           const normalized = await normalize(payload)
-          await upsert(normalized, payload, hash)
+          const applied = await upsert(normalized, payload, hash)
           await recordHash(hash)
-          console.log(`[worker] job=${job.id} type=${normalized.type} status=${normalized.status ?? 'n/a'}`)
+          const outcome = applied ? 'done' : 'blocked'
+          console.log(`[worker] type=${normalized.type} status=${normalized.status ?? 'n/a'} ${outcome}`)
         } catch (err) {
           const raceCheck = await prisma.payloadHash.findUnique({ where: { hash } })
           if (raceCheck) {
-            console.log(`[worker] job=${job.id} duplicate race — discarded`)
+            console.log(`[worker] duplicate race — discarded`)
             continue
           }
           throw err
@@ -63,7 +64,7 @@ export async function startWorker(): Promise<void> {
             retryCount: job.retryCount,
           },
         })
-        console.error(`[worker] job=${job.id} dead-lettered after ${job.retryCount} retries`)
+        console.error(`[worker] dead-lettered after ${job.retryCount} retries`)
       }
     }
   )

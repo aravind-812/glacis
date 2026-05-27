@@ -51,6 +51,9 @@ process.on('SIGTERM', shutdown)
 process.on('SIGINT', shutdown)
 
 async function main() {
+  await prisma.$connect()
+  console.log('[server] db connected')
+
   await startWorker()
 
   app.listen(config.PORT, () => {
