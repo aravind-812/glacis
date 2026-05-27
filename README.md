@@ -76,9 +76,9 @@ Two workers race on same job
 
 ---
 
-## Out-of-Order Events — Status Rank Guard
+## Out-of-Order Events — Atomic Rank Guard
 
-Every record stores a `status_rank` integer. Updates are only applied if the incoming rank is strictly higher.
+Every record stores a `status_rank` integer. Updates are only applied if the incoming rank is strictly higher. The guard is enforced inside a single SQL statement — no read-then-write race.
 
 ```
 Shipment ranks:   PICKED_UP(1) → IN_TRANSIT(2) → OUT_FOR_DELIVERY(3) → DELIVERED(4)
@@ -93,6 +93,15 @@ Example: DELIVERED arrives before IN_TRANSIT
   │           incoming rank 2 > stored rank 4? NO → skip    │
   │           result: DELIVERED preserved ✓                  │
   └─────────────────────────────────────────────────────────┘
+
+Implemented as a single atomic SQL statement (no separate read needed):
+
+  INSERT INTO shipments (...) VALUES (...)
+  ON CONFLICT (vendor_event_id) DO UPDATE SET
+    status = EXCLUDED.status, status_rank = EXCLUDED.status_rank, ...
+  WHERE shipments.status_rank < EXCLUDED.status_rank
+                                ↑
+                  Postgres serialises this — race-free under concurrency
 ```
 
 ---
@@ -174,6 +183,18 @@ copy amount_raw verbatim; use null for absent fields.
 │ raw_payload jsonb    │   └───────────────────────────────┘
 │ received_at          │
 └──────────────────────┘
+
+┌───────────────────────────────────────────────┐
+│ dead_letters                                  │
+│───────────────────────────────────────────────│
+│ id          uuid PK                           │
+│ job_id      — pg-boss job ID                  │
+│ payload     jsonb  ← original raw payload     │
+│ error       — serialised error from pg-boss   │
+│ retry_count — how many retries were exhausted │
+│ failed_at   timestamp                         │
+└───────────────────────────────────────────────┘
+Replay: re-POST dead_letters.payload to /webhook
 ```
 
 No FK between invoices and shipments — `tracking_ref` is a soft cross-reference via B/L number, joinable at query time.  
@@ -188,7 +209,7 @@ No FK between invoices and shipments — `tracking_ref` is a soft cross-referenc
 | **1** | **Async queue** — 202 immediately, process in background | Vendor gets ack before event is persisted. If worker crashes mid-job, pg-boss retries (safe — dedup handles it). |
 | **2** | **Content-addressed dedup** — SHA-256 of key-sorted JSON | Key sorting stabilises hash across vendors with non-deterministic key order. Server check is non-atomic (perf filter only); worker INSERT is the true gate. |
 | **3** | **Two-tier LLM** — cheap model first, capable fallback | Reduces cost for well-structured payloads. LangChain abstraction loses Anthropic-native prompt caching (`cache_control`) — can be re-added per-provider if needed. |
-| **4** | **Status rank guard** — only higher-rank events update the row | Prevents regression. Lower-ranked events that arrive late are permanently discarded — useful fields (location, carrier) in those events are lost. |
+| **4** | **Atomic rank guard** — `INSERT ... ON CONFLICT DO UPDATE WHERE status_rank < EXCLUDED.status_rank` | Single SQL statement, no read-then-write race. Lower-ranked late events are permanently discarded — useful fields (location, carrier) in those events are lost. |
 | **5** | **vendorEventId as upsert key** — one row per vendor event | Multiple vendors reporting the same shipment create separate rows. `trackingId` / `tracking_ref` enable soft grouping but there is no cross-vendor merge. |
 | **6** | **Raw payload stored as JSONB** | Full audit trail, replayable. Storage cost grows linearly with volume — partition or archive old rows in production. |
 | **7** | **Rank over state machine** — integer rank, not transition graph | Simpler to implement. Does not enforce valid transitions (e.g., DELIVERED → PICKED_UP from a different vendor is allowed). Good enough for the assignment's domain rules. |
@@ -243,26 +264,32 @@ done
 
 ## Production Roadmap
 
+### Done
+| Item | How |
+|---|---|
+| ✅ Atomic rank guard | `INSERT ON CONFLICT DO UPDATE WHERE status_rank < EXCLUDED.status_rank` |
+| ✅ Single shared DB client | `src/db.ts` — one PrismaClient, one pool across server + worker |
+| ✅ Config validation at startup | `src/config.ts` — zod schema, fails fast on missing env vars |
+| ✅ Graceful shutdown | `SIGTERM` / `SIGINT` → `boss.stop()` drains jobs, then `prisma.$disconnect()` |
+| ✅ Dead-letter queue | `deadLetter: 'webhooks-dead'` — exhausted jobs written to `dead_letters` table |
+
 ### P0 — Before any real traffic
 | Item | Why |
 |---|---|
 | Webhook HMAC / bearer token auth | Any caller can currently flood the queue |
-| Graceful shutdown (`boss.stop()` + drain) | SIGTERM kills in-flight jobs |
-| Structured logging (pino) + trace IDs | `console.log` is unfilterable in prod |
-| Dead-letter queue | Exhausted retries disappear silently |
+| Structured logging (pino) + trace IDs | `console.log` is unfilterable in prod — can't alert on error rates |
 
 ### P1 — Scaling
 | Item | Why |
 |---|---|
-| Separate HTTP + worker containers | Worker crash takes down ingestion surface |
-| PgBouncer / shared connection pool | Two separate pools (pg-boss + Prisma) under load |
-| LLM prompt caching | System prompt is ~400 tokens; expand past provider threshold to activate caching |
+| Separate HTTP + worker containers | Worker crash takes down ingestion surface; scale independently |
+| PgBouncer in front of Postgres | pg-boss and Prisma each hold their own pool; connection ceiling under load |
+| LLM prompt caching | System prompt ~400 tokens; expand past provider threshold to activate caching |
 | Rules-based pre-filter for known vendors | Avoid LLM cost for deterministic high-volume payloads |
 
 ### P2 — Correctness
 | Item | Why |
 |---|---|
 | Cross-vendor shipment merging | One row per vendor event; no canonical timeline across carriers |
-| Atomic rank update (SQL WHERE clause) | App-level read-then-write has a race window under concurrency |
 | Currency normalization | `amount_raw` is a verbatim string, not queryable by amount |
 | Secrets manager (Vault / AWS SSM) | API keys in env vars are not rotatable at runtime |
