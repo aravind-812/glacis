@@ -1,0 +1,59 @@
+generator client {
+  provider = "prisma-client"
+  output   = "../src/generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+model Shipment {
+  id            String   @id @default(uuid())
+  vendorEventId String   @unique @map("vendor_event_id")
+  payloadHash   String   @unique @map("payload_hash")
+  trackingId    String   @map("tracking_id")
+  status        String
+  statusRank    Int      @map("status_rank")
+  carrier       String?
+  location      String?
+  eventTime     DateTime @map("event_time")
+  rawPayload    Json     @map("raw_payload")
+  createdAt     DateTime @default(now()) @map("created_at")
+  updatedAt     DateTime @updatedAt @map("updated_at")
+
+  @@map("shipments")
+}
+
+model Invoice {
+  id            String   @id @default(uuid())
+  vendorEventId String   @unique @map("vendor_event_id")
+  payloadHash   String   @unique @map("payload_hash")
+  invoiceRef    String   @map("invoice_ref")
+  status        String
+  statusRank    Int      @map("status_rank")
+  carrier       String?
+  amountRaw     String?  @map("amount_raw")
+  currency      String?
+  eventTime     DateTime @map("event_time")
+  rawPayload    Json     @map("raw_payload")
+  createdAt     DateTime @default(now()) @map("created_at")
+  updatedAt     DateTime @updatedAt @map("updated_at")
+
+  @@map("invoices")
+}
+
+model Unclassified {
+  id          String   @id @default(uuid())
+  payloadHash String   @unique @map("payload_hash")
+  rawPayload  Json     @map("raw_payload")
+  receivedAt  DateTime @default(now()) @map("received_at")
+
+  @@map("unclassified")
+}
+
+model PayloadHash {
+  hash       String   @id
+  seenAt     DateTime @default(now()) @map("seen_at")
+
+  @@map("payload_hashes")
+}
