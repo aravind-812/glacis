@@ -1,0 +1,11 @@
+{
+  "billing_system": "freightfinance-pro",
+  "document_number": "FFP-2026-Q2-3341",
+  "document_type": "payment_confirmation",
+  "payment_ref": "PAY-2026-88123",
+  "amount_received": "USD 18750.00",
+  "payment_method": "SWIFT",
+  "payment_date": "2026-06-10T14:22:00Z",
+  "status": "fully_settled",
+  "settled_by": "ACME Logistics Ltd"
+}

@@ -1,0 +1,21 @@
+{
+  "billing_system": "freightfinance-pro",
+  "document_number": "FFP-2026-Q2-3341",
+  "document_type": "freight_invoice",
+  "bill_to": "ACME Logistics Ltd",
+  "bill_from": "MSC Mediterranean Shipping",
+  "linked_booking": "MSCU2604BKG441",
+  "financials": {
+    "currency": "USD",
+    "total_due": "18750.00",
+    "line_items": [
+      { "description": "Base ocean freight rate", "amount": "15000.00" },
+      { "description": "Peak season surcharge", "amount": "2500.00" },
+      { "description": "Documentation fee", "amount": "250.00" },
+      { "description": "Bunker adjustment factor (BAF)", "amount": "1000.00" }
+    ]
+  },
+  "status": "invoice_raised",
+  "raised_at": "2026-05-20T09:00:00Z",
+  "payment_due": "2026-06-19T23:59:59Z"
+}

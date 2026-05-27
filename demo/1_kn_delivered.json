@@ -1,0 +1,9 @@
+{
+  "provider": "kn-api",
+  "job_ref": "KN-2026-HAM-8841",
+  "shipment_stage": "cargo_released_consignee",
+  "container_id": "KNLU4412890",
+  "delivery_location": "Hamburg Fashion GmbH warehouse, Gate 4",
+  "event_timestamp": "2026-05-28T11:00:00+01:00",
+  "signed_by": "M. Fischer"
+}

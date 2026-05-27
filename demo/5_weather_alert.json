@@ -1,0 +1,11 @@
+{
+  "source": "maritime-weather-api",
+  "alert_type": "SEVERE_WEATHER",
+  "advisory_id": "WEA-2026-NAT-0041",
+  "region": "North Atlantic",
+  "issued": "2026-05-27T06:00:00Z",
+  "forecast": "Force 8-9 gale conditions expected between 52N-58N, 20W-35W",
+  "duration_hours": 72,
+  "affected_routes": ["Asia-Europe string", "Transatlantic"],
+  "recommended_action": "Vessels advised to consider weather routing adjustments"
+}

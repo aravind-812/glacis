@@ -1,0 +1,10 @@
+{
+  "provider": "kn-api",
+  "job_ref": "KN-2026-HAM-8841",
+  "shipment_stage": "origin_gate_in",
+  "container_id": "KNLU4412890",
+  "origin_port": "CNSHA",
+  "event_timestamp": "2026-05-10T08:15:00+08:00",
+  "shipper": "Shanghai Textiles Co.",
+  "consignee": "Hamburg Fashion GmbH"
+}
